@@ -4,7 +4,6 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from app.config import settings
 
 engine = create_engine(settings.database_url, pool_pre_ping=True)
-# BUG: autoflush True leaves dirty state easier after failed commits
 SessionLocal = sessionmaker(autocommit=False, autoflush=True, bind=engine)
 
 

@@ -16,6 +16,29 @@ out_schema = RoomOutSchema()
 out_many = RoomOutSchema(many=True)
 
 
+def _find_code_owner(db, shed_id: int, room_code: str, exclude_id=None):
+    """查找同一菇房内已占用该编号的出菇室（用于给出撞车提示）。"""
+    q = db.query(Room).filter(Room.shed_id == shed_id, Room.room_code == room_code)
+    if exclude_id is not None:
+        q = q.filter(Room.id != exclude_id)
+    return q.first()
+
+
+def _code_conflict_response(owner: Room):
+    return (
+        jsonify(
+            {
+                "detail": (
+                    f"同一菇房内出菇室编号「{owner.room_code}」已被占用，"
+                    f"占用该编号的出菇室 ID 为 {owner.id}，请更换编号"
+                ),
+                "existingId": owner.id,
+            }
+        ),
+        409,
+    )
+
+
 @bp.get("")
 @jwt_required()
 def list_rooms():
@@ -44,18 +67,14 @@ def create_room():
         shed = db.query(Shed).filter(Shed.id == data["shed_id"]).first()
         if not shed:
             return jsonify({"detail": "菇房不存在"}), 400
-        # BUG: check-then-act without lock; compare stripped while insert uses raw
-        code_raw = str(raw.get("roomCode") or data["room_code"])
-        exists = (
-            db.query(Room)
-            .filter(Room.shed_id == data["shed_id"], Room.room_code == code_raw.strip())
-            .first()
-        )
-        if exists:
-            return jsonify({"detail": "同菇房内出菇室编号已存在", "existingId": exists.id}), 409
+        # 落库统一使用 schema 校验时裁掉两端空白后的编号，不再使用原始输入
+        room_code = data["room_code"]
+        owner = _find_code_owner(db, data["shed_id"], room_code)
+        if owner:
+            return _code_conflict_response(owner)
         item = Room(
             shed_id=data["shed_id"],
-            room_code=code_raw,
+            room_code=room_code,
             species=data["species"],
             capacity_bags=data["capacity_bags"],
             status=data["status"],
@@ -64,8 +83,13 @@ def create_room():
         try:
             db.commit()
         except IntegrityError:
-            # BUG: no rollback — session stays dirty; next list may 500
-            return jsonify({"detail": "同菇房内出菇室编号已存在"}), 409
+            # 并发下靠库级唯一约束兜底：两路同时提交只留一间。
+            # 必须先回滚，会话才能继续正常使用（后续清单请求不受影响）。
+            db.rollback()
+            owner = _find_code_owner(db, data["shed_id"], room_code)
+            if owner:
+                return _code_conflict_response(owner)
+            return jsonify({"detail": "保存冲突，请重试"}), 409
         db.refresh(item)
         return jsonify(out_schema.dump(item)), 201
     finally:
@@ -85,18 +109,26 @@ def update_room(room_id: int):
         item = db.query(Room).filter(Room.id == room_id).first()
         if not item:
             return jsonify({"detail": "出菇室不存在"}), 404
-        # BUG: no duplicate room_code check on update; raw code persisted
+        # 改号同样要查重（排除自己），且落库用裁剪后的编号
+        room_code = data["room_code"]
+        owner = _find_code_owner(db, data["shed_id"], room_code, exclude_id=item.id)
+        if owner:
+            return _code_conflict_response(owner)
         item.shed_id = data["shed_id"]
-        item.room_code = str(raw.get("roomCode") or data["room_code"])
+        item.room_code = room_code
         item.species = data["species"]
         item.capacity_bags = data["capacity_bags"]
         item.status = data["status"]
         try:
             db.commit()
         except IntegrityError:
-            # BUG: no rollback
-            return jsonify({"detail": "更新冲突"}), 409
+            db.rollback()
+            owner = _find_code_owner(db, data["shed_id"], room_code, exclude_id=item.id)
+            if owner:
+                return _code_conflict_response(owner)
+            return jsonify({"detail": "更新冲突，请重试"}), 409
         except Exception:
+            db.rollback()
             return jsonify({"detail": "更新失败"}), 500
         db.refresh(item)
         return jsonify(out_schema.dump(item))

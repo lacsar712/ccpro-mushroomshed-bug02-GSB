@@ -12,8 +12,9 @@ class RoomCreateSchema(Schema):
     status = fields.Str(required=True, validate=validate.OneOf(ROOM_STATUSES))
 
     @pre_load
-    def _strip_code_for_validate_only(self, data, **kwargs):
-        # BUG: strip only in schema view; route still persists raw roomCode with spaces
+    def _strip_room_code(self, data, **kwargs):
+        # 落库与查重统一使用裁掉两端空白后的编号："R-01 " 与 "R-01" 是同一间。
+        # 裁剪发生在校验之前，纯空白的编号会被 Length(min=1) 拦下。
         if isinstance(data, dict) and "roomCode" in data and isinstance(data["roomCode"], str):
             data = {**data, "roomCode": data["roomCode"].strip()}
         return data
