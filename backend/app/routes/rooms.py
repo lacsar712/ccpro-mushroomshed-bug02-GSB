@@ -1,3 +1,5 @@
+from typing import Optional
+
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
 from marshmallow import ValidationError
@@ -14,6 +16,22 @@ bp = Blueprint("rooms", __name__, url_prefix="/api/rooms")
 create_schema = RoomCreateSchema()
 out_schema = RoomOutSchema()
 out_many = RoomOutSchema(many=True)
+
+
+def _find_by_code(db, shed_id: int, room_code: str, exclude_id: Optional[int] = None):
+    q = db.query(Room).filter(Room.shed_id == shed_id, Room.room_code == room_code)
+    if exclude_id is not None:
+        q = q.filter(Room.id != exclude_id)
+    return q.first()
+
+
+def _code_conflict_response(existing: Optional[Room], room_code: str):
+    if existing is not None:
+        return jsonify({
+            "detail": f"同一菇房内室编号「{room_code}」已被占用，占用它的出菇室 id 为 {existing.id}",
+            "existingId": existing.id,
+        }), 409
+    return jsonify({"detail": f"同一菇房内室编号「{room_code}」已存在"}), 409
 
 
 @bp.get("")
@@ -44,18 +62,14 @@ def create_room():
         shed = db.query(Shed).filter(Shed.id == data["shed_id"]).first()
         if not shed:
             return jsonify({"detail": "菇房不存在"}), 400
-        # BUG: check-then-act without lock; compare stripped while insert uses raw
-        code_raw = str(raw.get("roomCode") or data["room_code"])
-        exists = (
-            db.query(Room)
-            .filter(Room.shed_id == data["shed_id"], Room.room_code == code_raw.strip())
-            .first()
-        )
+        # schema 校验前已裁掉两端空白，查重与落库统一用裁剪后的编号
+        room_code = data["room_code"]
+        exists = _find_by_code(db, data["shed_id"], room_code)
         if exists:
-            return jsonify({"detail": "同菇房内出菇室编号已存在", "existingId": exists.id}), 409
+            return _code_conflict_response(exists, room_code)
         item = Room(
             shed_id=data["shed_id"],
-            room_code=code_raw,
+            room_code=room_code,
             species=data["species"],
             capacity_bags=data["capacity_bags"],
             status=data["status"],
@@ -64,8 +78,10 @@ def create_room():
         try:
             db.commit()
         except IntegrityError:
-            # BUG: no rollback — session stays dirty; next list may 500
-            return jsonify({"detail": "同菇房内出菇室编号已存在"}), 409
+            # 并发下唯一约束兜底：先回滚让会话恢复可用，再查出已占用的那间
+            db.rollback()
+            exists = _find_by_code(db, data["shed_id"], room_code)
+            return _code_conflict_response(exists, room_code)
         db.refresh(item)
         return jsonify(out_schema.dump(item)), 201
     finally:
@@ -85,18 +101,27 @@ def update_room(room_id: int):
         item = db.query(Room).filter(Room.id == room_id).first()
         if not item:
             return jsonify({"detail": "出菇室不存在"}), 404
-        # BUG: no duplicate room_code check on update; raw code persisted
+        shed = db.query(Shed).filter(Shed.id == data["shed_id"]).first()
+        if not shed:
+            return jsonify({"detail": "菇房不存在"}), 400
+        # 改号同样查重（排除自身），落库用裁剪后的编号
+        room_code = data["room_code"]
+        exists = _find_by_code(db, data["shed_id"], room_code, exclude_id=item.id)
+        if exists:
+            return _code_conflict_response(exists, room_code)
         item.shed_id = data["shed_id"]
-        item.room_code = str(raw.get("roomCode") or data["room_code"])
+        item.room_code = room_code
         item.species = data["species"]
         item.capacity_bags = data["capacity_bags"]
         item.status = data["status"]
         try:
             db.commit()
         except IntegrityError:
-            # BUG: no rollback
-            return jsonify({"detail": "更新冲突"}), 409
+            db.rollback()
+            exists = _find_by_code(db, data["shed_id"], room_code, exclude_id=item.id)
+            return _code_conflict_response(exists, room_code)
         except Exception:
+            db.rollback()
             return jsonify({"detail": "更新失败"}), 500
         db.refresh(item)
         return jsonify(out_schema.dump(item))
